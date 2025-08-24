@@ -1,3 +1,6 @@
+# Use
+
+```bash
 pve-restore-meta.py 
 
 --host xxx 
@@ -8,3 +11,4 @@ pve-restore-meta.py
 --token-secret 'xxx' 
 --preserve-meta 
 --insecure
+```
