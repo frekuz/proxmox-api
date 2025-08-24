@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
-Interaktiver Single-File-Restore über die PVE-API (ohne proxmox-backup-client).
-Variante mit 'requests' statt 'httpx'. Unterstützt --preserve-meta.
 
 Beispiel:
   python pve_file_restore.py \
