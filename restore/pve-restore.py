@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-
+# -*- coding: utf-8 -*-
 """
+- --insecure : Zertifikatsprüfung aus (nur Tests); Warnung wird dann gezielt unterdrückt
+- --preserve-meta : mtime nach Download setzen (best effort) - http dowmload erhält nicht den owner/group
 
-Beispiel:
-  python pve_file_restore.py \
+python pve-restore.py \
     --host pve.example.com --port 8006 --node pvenode1 --storage pbs-store \
     --token-id "root@pam!script" --token-secret "SECRET" \
-    --vmid 101 \
-    --download-dir ./downloads \
+    --vmid 102 \
+    --node example.node
+    --storage PM-BACKUP
+    --download-dir ./restore \
+    --ca-cert /etc/pve/pve-root-ca.pem \
     --preserve-meta
+
+
 """
 
 import argparse
@@ -18,9 +24,17 @@ import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
+
+# Warnungen bei --insecure gezielt abschalten
+try:
+    import urllib3
+    from urllib3.exceptions import InsecureRequestWarning
+except Exception:
+    urllib3 = None
+    InsecureRequestWarning = None
 
 
 # --------------------------- CLI ---------------------------------
@@ -33,8 +47,13 @@ def parse_args():
     ap.add_argument("--token-id", required=True, help="API-Token ID, z.B. root@pam!script")
     ap.add_argument("--token-secret", required=True, help="API-Token Secret")
     ap.add_argument("--vmid", type=int, default=None, help="Optional: VMID zum Filtern der Backups")
-    ap.add_argument("--insecure", action="store_true",
-                    help="TLS-Validierung deaktivieren (nur Testumgebungen)")
+
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--ca-cert", default=None,
+                   help="Pfad zu einer CA-Bundle-PEM-Datei (empfohlen).")
+    g.add_argument("--insecure", action="store_true",
+                   help="TLS-Validierung deaktivieren (nur Testumgebungen)")
+
     ap.add_argument("--download-dir", default="downloads",
                     help="Zielverzeichnis für Downloads (Standard: ./downloads)")
     ap.add_argument("--preserve-meta", action="store_true",
@@ -135,11 +154,15 @@ class PVEClient:
     LIST_TIMEOUT = (10, 60)   # (connect, read) Sekunden
     READ_TIMEOUT = (10, 600)  # (connect, read) für Downloads
 
-    def __init__(self, base_url: str, token_id: str, token_secret: str, verify_tls: bool):
+    def __init__(self, base_url: str, token_id: str, token_secret: str, verify: Union[bool, str]):
         self.base = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.headers.update({"Authorization": f"PVEAPIToken {token_id}={token_secret}"})
-        self.session.verify = verify_tls  # False -> unsicher (nur für Tests)
+        self.session.verify = verify  # True | False | Pfad zu CA-Bundle
+
+        # Warnung nur deaktivieren, wenn verify==False gewünscht ist
+        if verify is False and urllib3 and InsecureRequestWarning:
+            urllib3.disable_warnings(InsecureRequestWarning)
 
     def list_backups(self, node: str, storage: str, vmid: Optional[int] = None) -> List[Dict[str, Any]]:
         url = f"{self.base}/api2/json/nodes/{node}/storage/{storage}/content"
@@ -334,7 +357,22 @@ def file_browser(client: PVEClient, node: str, storage: str, volume: str,
 def main():
     args = parse_args()
     base = f"https://{args.host}:{args.port}"
-    client = PVEClient(base, args.token_id, args.token_secret, verify_tls=not args.insecure)
+
+    # verify-Parameter bestimmen:
+    # - Pfad zu CA-Bundle, wenn --ca-cert angegeben (empfohlen)
+    # - False, wenn --insecure (Warnung wird dann unterdrückt)
+    # - True, sonst Standardsystem-CA
+    verify_param: Union[bool, str]
+    if args.ca_cert:
+        verify_param = args.ca_cert
+        if not Path(args.ca_cert).exists():
+            sys.exit(f"CA-Bundle nicht gefunden: {args.ca_cert}")
+    elif args.insecure:
+        verify_param = False
+    else:
+        verify_param = True
+
+    client = PVEClient(base, args.token_id, args.token_secret, verify=verify_param)
 
     print("> Lade Backups …")
     backups = client.list_backups(args.node, args.storage, args.vmid)
