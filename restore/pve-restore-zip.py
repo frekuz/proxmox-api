@@ -3,11 +3,13 @@
 """
 
 Beispiel:
-  python pve_file_restore.py \
+  python pve-restore-zip.py \
     --host pve.example.com --port 8006 --node pvenode1 --storage pbs-store \
     --token-id "root@pam!script" --token-secret "SECRET" \
-    --vmid 101 \
-    --download-dir ./downloads \
+    --vmid 102 \
+    --node example.node
+    --storage PM-BACKUP
+    --download-dir ./restore \
     --ca-cert /etc/pve/pve-root-ca.pem \
     --preserve-meta
 """
