@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Interaktiver Single-File-Restore über die PVE-API (ohne proxmox-backup-client).
-Neu: --preserve-meta setzt (best effort) Mode/Owner/GID/mtime nach dem Download.
+Variante mit 'requests' statt 'httpx'. Unterstützt --preserve-meta.
 
 Beispiel:
   python pve_file_restore.py \
@@ -22,12 +22,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+import requests
 
 
 # --------------------------- CLI ---------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser(description="PVE Single-File-Restore via REST-API")
+    ap = argparse.ArgumentParser(description="PVE Single-File-Restore via REST-API (requests)")
     ap.add_argument("--host", required=True, help="PVE Hostname oder IP")
     ap.add_argument("--port", type=int, default=8006, help="PVE API Port (Standard: 8006)")
     ap.add_argument("--node", required=True, help="PVE Node, auf dem der Restore-Helper läuft")
@@ -67,7 +67,6 @@ def b64_path(path: str) -> str:
 
 
 def is_dir(entry: Dict[str, Any]) -> bool:
-    # PVE liefert "type": "d"|"f" und "leaf": bool
     t = (entry.get("type") or "").lower()
     if t in ("d", "dir", "directory", "folder"):
         return True
@@ -77,12 +76,6 @@ def is_dir(entry: Dict[str, Any]) -> bool:
 
 
 def parse_mode(value: Any) -> Optional[int]:
-    """
-    Versucht, Dateimode (Permissions) aus verschiedenen Formaten zu lesen:
-    - int (z.B. 420) -> direkt
-    - string "0644" oder "644" -> als oktal interpretieren
-    - string wie "rw-r--r--" -> nicht unterstützt (None)
-    """
     if value is None:
         return None
     if isinstance(value, int):
@@ -91,18 +84,13 @@ def parse_mode(value: Any) -> Optional[int]:
         s = value.strip()
         if s.isdigit():
             try:
-                # wenn führende 0 -> oktal, ansonsten trotzdem oktal interpretieren
-                return int(s, 8)
+                return int(s, 8)  # oktal interpretieren
             except ValueError:
                 return None
     return None
 
 
 def apply_metadata_if_possible(entry: Dict[str, Any], target: Path, verbose: bool = True):
-    """
-    Setzt mtime/mode/owner (wenn möglich) anhand der Entry-Metadaten.
-    Erwartete (optionale) Felder: mtime, mode (oder permissions), uid, gid.
-    """
     # mtime
     mtime = entry.get("mtime")
     if isinstance(mtime, (int, float)) and mtime > 0:
@@ -113,9 +101,7 @@ def apply_metadata_if_possible(entry: Dict[str, Any], target: Path, verbose: boo
                 print(f"  -> Hinweis: mtime konnte nicht gesetzt werden: {e}")
 
     # mode
-    mode = entry.get("mode")
-    if mode is None:
-        mode = entry.get("permissions")
+    mode = entry.get("mode") if "mode" in entry else entry.get("permissions")
     pmode = parse_mode(mode)
     if pmode is not None:
         try:
@@ -124,7 +110,7 @@ def apply_metadata_if_possible(entry: Dict[str, Any], target: Path, verbose: boo
             if verbose:
                 print(f"  -> Hinweis: chmod fehlgeschlagen ({mode}): {e}")
 
-    # owner/group (nur als root sinnvoll; Windows kann chown nicht)
+    # owner/group (nur als root sinnvoll)
     uid = entry.get("uid")
     gid = entry.get("gid")
     if uid is not None or gid is not None:
@@ -133,7 +119,6 @@ def apply_metadata_if_possible(entry: Dict[str, Any], target: Path, verbose: boo
                 if verbose:
                     print("  -> Hinweis: chown übersprungen (nicht als root ausgeführt).")
             else:
-                # fehlende Werte durch aktuellen übernehmen
                 st = target.stat()
                 tuid = int(uid) if uid is not None else st.st_uid
                 tgid = int(gid) if gid is not None else st.st_gid
@@ -147,42 +132,44 @@ def apply_metadata_if_possible(entry: Dict[str, Any], target: Path, verbose: boo
                 print(f"  -> Hinweis: chown fehlgeschlagen: {e}")
 
 
-# --------------------------- PVE API Client -----------------------
+# --------------------------- PVE API Client (requests) ------------
 class PVEClient:
+    LIST_TIMEOUT = (10, 60)   # (connect, read) Sekunden
+    READ_TIMEOUT = (10, 600)  # (connect, read) für Downloads
+
     def __init__(self, base_url: str, token_id: str, token_secret: str, verify_tls: bool):
         self.base = base_url.rstrip("/")
-        self.headers = {"Authorization": f"PVEAPIToken {token_id}={token_secret}"}
-        self.verify_tls = verify_tls
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"PVEAPIToken {token_id}={token_secret}"})
+        self.session.verify = verify_tls  # False -> unsicher (nur für Tests)
 
     def list_backups(self, node: str, storage: str, vmid: Optional[int] = None) -> List[Dict[str, Any]]:
         url = f"{self.base}/api2/json/nodes/{node}/storage/{storage}/content"
         params = {"content": "backup"}
         if vmid:
             params["vmid"] = vmid
-        with httpx.Client(verify=self.verify_tls, headers=self.headers, timeout=60.0) as c:
-            r = c.get(url, params=params)
-            r.raise_for_status()
-            data = r.json()["data"]
-            data.sort(key=lambda e: e.get("ctime", 0), reverse=True)
-            return data
+        r = self.session.get(url, params=params, timeout=self.LIST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()["data"]
+        data.sort(key=lambda e: e.get("ctime", 0), reverse=True)
+        return data
 
     def fr_list(self, node: str, storage: str, volume: str, path_b64: str) -> List[Dict[str, Any]]:
         url = f"{self.base}/api2/json/nodes/{node}/storage/{storage}/file-restore/list"
         params = {"volume": volume, "filepath": path_b64}
-        with httpx.Client(verify=self.verify_tls, headers=self.headers, timeout=120.0) as c:
-            r = c.get(url, params=params)
-            r.raise_for_status()
-            return r.json()["data"]
+        r = self.session.get(url, params=params, timeout=self.LIST_TIMEOUT)
+        r.raise_for_status()
+        return r.json()["data"]
 
     def fr_download(self, node: str, storage: str, volume: str, path_b64: str, out_path: Path) -> None:
         url = f"{self.base}/api2/json/nodes/{node}/storage/{storage}/file-restore/download"
         params = {"volume": volume, "filepath": path_b64}
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with httpx.Client(verify=self.verify_tls, headers=self.headers, timeout=None) as c:
-            with c.stream("GET", url, params=params) as r:
-                r.raise_for_status()
-                with out_path.open("wb") as f:
-                    for chunk in r.iter_bytes():
+        with self.session.get(url, params=params, stream=True, timeout=self.READ_TIMEOUT) as r:
+            r.raise_for_status()
+            with out_path.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
                         f.write(chunk)
 
 
@@ -242,11 +229,10 @@ def file_browser(client: PVEClient, node: str, storage: str, volume: str,
     while True:
         try:
             entries = client.fr_list(node, storage, volume, b64_path(cwd))
-        except httpx.HTTPStatusError as e:
+        except requests.HTTPError as e:
             print(f"Fehler beim Listen von '{cwd}': {e}")
             entries = []
 
-        # typische Felder: text (Name), type ('d'/'f'), size, mtime, mode, uid, gid
         entries.sort(key=lambda e: (e.get("type") != "d", e.get("text") or ""))
 
         print(f"\nPfad: {cwd}")
@@ -326,7 +312,7 @@ def file_browser(client: PVEClient, node: str, storage: str, volume: str,
                     print(f"Überspringe ungültige Nummer {n}."); continue
                 ent = entries[n - 1]
                 if is_dir(ent):
-                    print(f"Überspringe Verzeichnis '{ent.get('text')}'. (Dieses Skript lädt nur Dateien)"); 
+                    print(f"Überspringe Verzeichnis '{ent.get('text')}'. (Dieses Skript lädt nur Dateien)")
                     continue
                 name = ent.get("text") or "download.bin"
                 guest_path = (Path(cwd) / name).as_posix()
@@ -337,7 +323,7 @@ def file_browser(client: PVEClient, node: str, storage: str, volume: str,
                     print(f"  -> OK: {out_path}")
                     if preserve_meta:
                         apply_metadata_if_possible(ent, out_path, verbose=True)
-                except httpx.HTTPStatusError as e:
+                except requests.HTTPError as e:
                     print(f"  -> FEHLER: {e}")
             time.sleep(0.2)
         else:
@@ -352,7 +338,6 @@ def main():
     base = f"https://{args.host}:{args.port}"
     client = PVEClient(base, args.token_id, args.token_secret, verify_tls=not args.insecure)
 
-    # 1) Backups auflisten und auswählen
     print("> Lade Backups …")
     backups = client.list_backups(args.node, args.storage, args.vmid)
     choice = choose_backup(backups)
@@ -360,7 +345,6 @@ def main():
     ctime = choice.get("ctime")
     print(f"\nGewählt:\n  VolID : {volid}\n  ctime : {epoch_to_iso8601_z(int(ctime)) if ctime else '-'}")
 
-    # 2) Dateibrowser & Downloads
     download_dir = Path(args.download_dir).resolve()
     file_browser(client, args.node, args.storage, volid, download_dir, args.preserve_meta)
 
